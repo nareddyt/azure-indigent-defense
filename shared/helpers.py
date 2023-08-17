@@ -3,15 +3,15 @@ import requests
 from time import sleep
 from datetime import date
 import logging
-from typing import Dict, Optional, Tuple, Literal
+from typing import Dict, Optional, Tuple, Literal, Union
 from enum import Enum
 import xxhash
 from bs4 import BeautifulSoup
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContainerClient
 from azure.cosmos import CosmosClient
 
 
-def initialize_session():
+def initialize_session() -> requests.Session :
     # initialize session
     session = requests.Session()
     # allow bad ssl and turn off warnings
@@ -22,7 +22,7 @@ def initialize_session():
     return session
 
 
-def initialize_blob_container_client(container_name):
+def initialize_blob_container_client(container_name) -> ContainerClient:
     blob_connection_str = os.getenv("ScrapeDataStorage")
     blob_service_client: BlobServiceClient = BlobServiceClient.from_connection_string(
         blob_connection_str
@@ -41,10 +41,10 @@ def initialize_cosmos_db_client(container_name):
     return container_client
 
 
-def write_debug_and_quit(
+def write_debug_and_raise(
     page_text: str, verification_text: Optional[str] = None
 ) -> None:
-    logging.error(
+    error_msg: str = (
         (
             f"{verification_text} could not be found in page."
             if verification_text
@@ -52,9 +52,12 @@ def write_debug_and_quit(
         )
         + f" Aborting. Writing /data/debug.html with response. May not be HTML."
     )
+
     with open(os.path.join("data", "debug.html"), "w") as file_handle:
         file_handle.write(page_text)
-    sys.exit(1)
+    
+    logging.error(error_msg)
+    raise Exception(error_msg)
 
 
 # helper function to make form data
@@ -89,50 +92,50 @@ def create_search_form_data(
 
 
 class HTTPMethod(Enum):
-    POST: int = 1
-    GET: int = 2
+    POST = 1
+    GET = 2
 
 
 def request_page_with_retry(
     session: requests.Session,
     url: str,
     verification_text: Optional[str] = None,
-    http_method: Literal[HTTPMethod.POST, HTTPMethod.GET] = HTTPMethod.POST,
+    http_method: HTTPMethod = HTTPMethod.POST,
     params: Dict[str, str] = {},
     data: Optional[Dict[str, str]] = None,
     max_retries: int = 5,
-    ms_wait: str = 200,
-) -> Tuple[str, bool]:
-    response = None
-    for i in range(max_retries):
+    ms_wait: int = 200,
+) -> str:
+    response: Union[requests.Response, None] = None
+    i: int = 0
+
+    while True:
+        logging.info(f"Making {http_method.name} request to url {url}...")
+        response = session.request(
+            method=http_method.name,
+            url=url,
+            params=params,
+            data=data,
+        )
+        if response.ok:
+            break
+
+        logging.exception(f"Try {i} - failed to {http_method.name} url {url} with code {response.status_code}.")
         sleep(ms_wait / 1000 * (i + 1))
-        failed = False
-        try:
-            if http_method == HTTPMethod.POST:
-                if not data:
-                    response = session.post(url, params=params)
-                else:
-                    response = session.post(url, data=data, params=params)
-            elif http_method == HTTPMethod.GET:
-                if not data:
-                    response = session.get(url, params=params)
-                else:
-                    response = session.get(url, data=data, params=params)
-            response.raise_for_status()
-            if verification_text:
-                if verification_text not in response.text:
-                    failed = True
-                    logging.error(
-                        f"Verification text {verification_text} not in response"
-                    )
-        except requests.RequestException as e:
-            logging.exception(f"Failed to get url {url}, try {i}")
-            failed = True
-        if failed:
-            write_debug_and_quit(
+        i += 1
+
+        if i > max_retries:
+            write_debug_and_raise(
                 verification_text=verification_text,
                 page_text=response.text,
             )
+
+    if verification_text and verification_text not in response.text:
+        write_debug_and_raise(
+            verification_text=verification_text,
+            page_text=response.text,
+        )
+
     return response.text
 
 def create_single_case_search_form_data(hidden_values: Dict[str, str], case_number: str):

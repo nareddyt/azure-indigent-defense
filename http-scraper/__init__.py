@@ -1,55 +1,53 @@
-import logging, os, csv, urllib.parse, json
-from typing import List, Optional
+import logging, os, csv, urllib.parse, json, requests
+from typing import List, Any, Optional
 from datetime import datetime, timedelta, date
 from time import time
 
-from requests import *
 from bs4 import BeautifulSoup
 import azure.functions as func
+from azure.storage.blob import ContainerClient
 
-from azure.storage.blob import BlobServiceClient, ContainerClient
-from azure.identity import DefaultAzureCredential
 
 from shared.helpers import *
 
+# Environment variables that MUST be set when running the function.
+# If you forget to set them, function will fail loudly (crash).
+CONTAINER_NAME_HTML: str = os.environ["blob_container_name_html"]
+CASE_BATCH_SIZE: int = int(os.environ["cases_batch_size"])
 
-container_name_html = os.getenv("blob_container_name_html")
-SESSION = None
-CONTAINER_CLIENT_HTML = None
+# Cache expensive computation for potential re-use
+# https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-python#global-variables
+SESSION : Optional[requests.Session] = None
+CONTAINER_CLIENT_HTML : Optional[ContainerClient] = None
 
 def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
     logging.info("Python HTTP trigger function received a request.")
-    global container_name_html
 
-    req_body = req.get_json()
+    req_body: Any = req.get_json()
     # Get parameters from request payload
     # TODO - seeing as how this will be running in a context where we want to keep time < 2-15 min,
     # and run many in parallel,
     # do we still need the 'back-up' start/end times (based off today) and 'backup' county ("hays")?
     # May be better to simple require certain parameters?
     # Are we worried about Odyssey noticing a ton of parallel requests?
-    start_date = date.fromisoformat(
+
+    start_date: date = date.fromisoformat(
         req_body.get("start_date", (date.today() - timedelta(days=1)).isoformat())
     )
-    end_date = date.fromisoformat(req_body.get("end_date", date.today().isoformat()))
-    county = req_body.get("county", "hays")
-    judicial_officers = req_body.get("judicial_officers", [])
+    end_date: date = date.fromisoformat(req_body.get("end_date", date.today().isoformat()))
+    county: str = req_body.get("county", "hays")
+    judicial_officers: List[str] = req_body.get("judicial_officers", [])
     ms_wait = int(req_body.get("ms_wait", "200"))
-    log_level = req_body.get("log_level", "INFO")
-    court_calendar_link_text = req_body.get(
-        "court_calendar_link_text", "Court Calendar"
-    )
-    location = req_body.get("location", None)
-    test = bool(req_body.get("test", None))
-    overwrite = test or bool(req_body.get("overwrite", None))
-
-    # get size of case batches
-    cases_batch_size = int(os.getenv("cases_batch_size"))
+    log_level: str = req_body.get("log_level", "INFO")
+    court_calendar_link_text: str = req_body.get("court_calendar_link_text", "Court Calendar")
+    location: Optional[str] = req_body.get("location", None)
+    test: Optional[str] = req_body.get("test", None)
+    is_test = bool(test)
 
     # Get/initialize blob container client for sending html files to
     global CONTAINER_CLIENT_HTML
     if CONTAINER_CLIENT_HTML == None:
-        CONTAINER_CLIENT_HTML = initialize_blob_container_client(container_name_html)
+        CONTAINER_CLIENT_HTML = initialize_blob_container_client(CONTAINER_NAME_HTML)
 
     # Get/initialize session
     global SESSION
@@ -57,91 +55,39 @@ def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
         SESSION = initialize_session()
     
     # initialize logger
-    logger = logging.getLogger(name="pid: " + str(os.getpid()))
-    logging.basicConfig()
+    logger: logging.Logger = logging.getLogger(name="pid: " + str(os.getpid()))
     logging.root.setLevel(level=log_level)
 
     # make cache directories if not present
-    case_html_path = os.path.join(
+    case_html_path: str = os.path.join(
         os.path.dirname(__file__), "..", "data", county, "case_html"
     )
     os.makedirs(case_html_path, exist_ok=True)
 
     # get county portal and version year information from csv file
-    base_url = odyssey_version = notes = None
-    with open(
-        os.path.join(
-            os.path.dirname(__file__), "..", "resources", "texas_county_data.csv"
-        ),
-        mode="r",
-    ) as file_handle:
-        csv_file = csv.DictReader(file_handle)
-        for row in csv_file:
-            if row["county"].lower() == county.lower():
-                base_url = row["portal"]
-                # add trailing slash if not present, otherwise urljoin breaks
-                if base_url[-1] != "/":
-                    base_url += "/"
-                logger.info(f"{base_url} - scraping this url")
-                odyssey_version = int(row["version"].split(".")[0])
-                notes = row["notes"]
-                break
-    if not base_url or not odyssey_version:
-        raise Exception(
-            "The required data to scrape this county is not in ./resources/texas_county_data.csv"
-        )
+    base_url, odyssey_version, notes = parse_csv(
+        county_to_find=county,
+        logger=logger,
+    )
 
-    # if odyssey_version < 2017, scrape main page first to get necessary data
-    if odyssey_version < 2017:
-        # some sites have a public guest login that must be used
-        if "PUBLICLOGIN#" in notes:
-            userpass = notes.split("#")[1].split("/")
-
-            data = {
-                "UserName": userpass[0],
-                "Password": userpass[1],
-                "ValidateUser": "1",
-                "dbKeyAuth": "Justice",
-                "SignOn": "Sign On",
-            }
-
-            response = request_page_with_retry(
-                session=SESSION,
-                url=urllib.parse.urljoin(base_url, "login.aspx"),
-                http_method=HTTPMethod.GET,
-                ms_wait=ms_wait,
-                data=data,
-            )
-
-        main_page_html = request_page_with_retry(
-            session=SESSION,
-            url=base_url,
-            verification_text="ssSearchHyperlink",
-            http_method=HTTPMethod.GET,
-            ms_wait=ms_wait,
-        )
-        main_soup = BeautifulSoup(main_page_html, "html.parser")
-        # build url for court calendar
-        search_page_id = None
-        for link in main_soup.select("a.ssSearchHyperlink"):
-            if court_calendar_link_text in link.text:
-                search_page_id = link["href"].split("?ID=")[1].split("'")[0]
-        if not search_page_id:
-            write_debug_and_quit(
-                verification_text="Court Calendar link",
-                page_text=main_page_html,
-            )
-        search_url = base_url + "Search.aspx?ID=" + search_page_id
+    # determine the court calendar URL
+    search_url: str = find_search_url(
+        county=county, 
+        base_url=base_url, 
+        odyssey_version=odyssey_version, 
+        notes=notes, 
+        court_calendar_link_text=court_calendar_link_text, 
+        session=SESSION, 
+        ms_wait=ms_wait,
+        logger=logger,
+    )
+    search_verification_text: str = "Court Calendar" if odyssey_version < 2017 else "SearchCriteria.SelectedCourt"
 
     # hit the search page to gather initial data
-    search_page_html = request_page_with_retry(
+    search_page_html: str = request_page_with_retry(
         session=SESSION,
-        url=search_url
-        if odyssey_version < 2017
-        else urllib.parse.urljoin(base_url, "Home/Dashboard/26"),
-        verification_text="Court Calendar"
-        if odyssey_version < 2017
-        else "SearchCriteria.SelectedCourt",
+        url=search_url,
+        verification_text=search_verification_text,
         http_method=HTTPMethod.GET,
         ms_wait=ms_wait,
     )
@@ -225,7 +171,7 @@ def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
                 logger.info(f"{len(case_urls)} cases found")
 
                 # if there are 10 or less cases, or it's a test run, just scrape now
-                if len(case_urls) <= 10 or test:
+                if len(case_urls) <= 10 or is_test:
                     for case_url in case_urls:
                         case_id = case_url.split("=")[1]
                         logger.info(f"{case_id} - scraping case")
@@ -240,9 +186,9 @@ def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
                         logger.info(f"{len(case_html)} response string length")
                         file_hash_dict = hash_case_html(case_html)
                         blob_name = f"{file_hash_dict['case_no']}:{county}:{date_string_underscore}:{file_hash_dict['file_hash']}.html"
-                        logger.info(f"Sending {blob_name} to {container_name_html} container...")
-                        write_string_to_blob(file_contents=case_html, blob_name=blob_name, container_client=CONTAINER_CLIENT_HTML, container_name=container_name_html)
-                        if test:
+                        logger.info(f"Sending {blob_name} to {CONTAINER_NAME_HTML} container...")
+                        write_string_to_blob(file_contents=case_html, blob_name=blob_name, container_client=CONTAINER_CLIENT_HTML, container_name=CONTAINER_NAME_HTML)
+                        if is_test:
                             logger.info("Testing, stopping after first case")
                             # bail
                             return
@@ -316,8 +262,8 @@ def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
                     file_hash_dict = hash_case_html(case_html)
                     blob_name = f"{file_hash_dict['case_no']}:{county}:{date_string_underscore}:{file_hash_dict['file_hash']}.html"
                     logger.info(f"Sending {blob_name} to blob...")
-                    write_string_to_blob(file_contents=case_html, blob_name=blob_name, container_client=CONTAINER_CLIENT_HTML, container_name=container_name_html)
-                    if test:
+                    write_string_to_blob(file_contents=case_html, blob_name=blob_name, container_client=CONTAINER_CLIENT_HTML, container_name=CONTAINER_NAME_HTML)
+                    if is_test:
                         logger.info("Testing, stopping after first case")
                         return
 
@@ -328,3 +274,113 @@ def main(req: func.HttpRequest, msg: func.Out[List[str]]) -> func.HttpResponse:
         f"Finished scraping cases for {judicial_officers} in {county} from {start_date} to {end_date}",
         status_code=200,
     )
+
+def parse_csv(county_to_find: str, logger: logging.Logger) -> tuple[str, int, str]:
+    """
+    Parses portal metadata from the static CSV for the county we are parsing.
+
+    :returns: 
+        - base_url - the base url of the portal for the county
+        - odyssey_version - the version that the portal for the county uses
+        - notes - any additional encoded text for the portal
+    """
+    with open(
+        os.path.join(
+            os.path.dirname(__file__), "..", "resources", "texas_county_data.csv"
+        ),
+        mode="r",
+    ) as file_handle:
+        csv_file = csv.DictReader(file_handle)
+        for row in csv_file:
+            if row["county"].lower() == county_to_find.lower():
+                base_url: str = row["portal"]
+                # add trailing slash if not present, otherwise urljoin breaks
+                if base_url[-1] != "/":
+                    base_url += "/"
+
+                odyssey_version: int = int(row["version"].split(".")[0])
+                notes: str = row["notes"]
+                logger.info(f"{base_url} - scraping this url")
+
+                return base_url, odyssey_version, notes
+            
+    raise Exception(
+        f"The required data to scrape this county is not in ./resources/texas_county_data.csv, could not find county = {county_to_find}"
+    )
+
+def maybe_login(county: str, base_url: str, notes: str, session: requests.Session, ms_wait: int) -> None:
+    """
+    Tries to login to the portal with the username and password provided in CSV notes.
+    """
+    if "PUBLICLOGIN#" not in notes:
+        return
+    
+    notes_split: list[str] = notes.split("#")
+    if len(notes_split) < 3:
+        raise Exception(
+            f"For {county}, the NOTES section is malformed. Expected at least 2 `#` signs in {notes}."
+        )
+
+    userpass_split: list[str] = notes_split[1].split("/")
+    if len(userpass_split) != 2:
+        raise Exception(
+            f"For {county}, the NOTES section is malformed. Expected exactly 1 `/` sign in {notes}."
+        )
+
+    data: dict[str, str] = {
+        "UserName": userpass_split[0],
+        "Password": userpass_split[1],
+        "ValidateUser": "1",
+        "dbKeyAuth": "Justice",
+        "SignOn": "Sign On",
+    }
+
+    request_page_with_retry(
+        session=session,
+        url=urllib.parse.urljoin(base_url, "login.aspx"),
+        http_method=HTTPMethod.GET,
+        ms_wait=ms_wait,
+        data=data,
+    )
+
+def find_search_url(county: str, base_url: str, odyssey_version: int, notes: str,
+                    court_calendar_link_text: str, session: requests.Session, 
+                    ms_wait: int, logger: logging.Logger) -> str:
+    """
+    Finds the URL to search the court calendar.
+    Depending on the odyssey version, we may need to make a few requests
+    to arrive at the search page.
+
+    :returns: search_url: The URL to the court calendar search page.
+    """
+    if odyssey_version >= 2017:
+        # Newer portal versions have a static search URL, no need to find it.
+        return urllib.parse.urljoin(base_url, "Home/Dashboard/26")
+    
+    # Scrape main page first to get necessary data.
+    # Some sites have a public guest login that must be used.
+    maybe_login(county=county, base_url=base_url, notes=notes, session=session, ms_wait=ms_wait)
+
+    # After login, get main page
+    main_page_html: str = request_page_with_retry(
+        session=session,
+        url=base_url,
+        verification_text="ssSearchHyperlink",
+        http_method=HTTPMethod.GET,
+        ms_wait=ms_wait,
+    )
+        
+    main_soup = BeautifulSoup(main_page_html, "html.parser")
+    for link in main_soup.select("a.ssSearchHyperlink"):
+        if court_calendar_link_text in link.text:
+            # build url for court calendar
+            logger.info(f"Looking for court calendar URL in link: {link}")
+            search_page_id: str = link["href"].split("?ID=")[1].split("'")[0]
+            search_url: str = base_url + "Search.aspx?ID=" + search_page_id
+            return search_url
+        
+    write_debug_and_raise(
+        verification_text="Court Calendar link",
+        page_text=main_page_html,
+    )
+    return '' # doesn't matter
